@@ -32,7 +32,7 @@ def load_config(*config_paths):
         'community_detector': {'n_neighbors': 15, 'use_weights': False},
         'streamlit_ui': {'title': "M1 SEO Analyzer", 'max_upload_size_mb': 200},
         'benchmark': {'num_test_vectors': 10000, 'num_query_vectors': 100, 'pdf_test_file': "data/sample_benchmark.pdf"},
-        'openai': {'api_key': "YOUR_OPENAI_API_KEY_HERE", 'model': "gpt-3.5-turbo", 'temperature': 0.7, 'max_tokens': 250}
+        'openai': {'api_key': "YOUR_OPENAI_API_KEY_HERE", 'model': "gpt-4o-mini", 'temperature': 0.7, 'max_tokens': 250}
     }
 
     final_config_data = base_config_data.copy()
