@@ -2,52 +2,109 @@
 from pyvis.network import Network
 import igraph as ig
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple # Added Tuple
 from typing import Dict, Any # Added for new function
 import pandas as pd # Added for new function
 import seaborn as sns # Added for new function
 import matplotlib.pyplot as plt # Added for new function
 from sklearn.feature_extraction.text import TfidfVectorizer # Added for new function
 import os # For saving temp file
+from scipy.sparse import csr_matrix # Added for type hint
 
 def create_interactive_community_graph(
     embeddings: np.ndarray, # For node positions (optional, can use UMAP/tSNE)
-    adj_matrix_sparse, # The sparse adjacency matrix from kneighbors_graph
+    adj_matrix_sparse: csr_matrix, # The sparse adjacency matrix from kneighbors_graph
     communities: ig.VertexClustering,
     chunks: List[str], # To get text for node tooltips
-    output_filename: str = "community_graph.html"
+    chunk_to_pdf_map: List[str], # Add this parameter
+    output_filename: str = "community_graph.html",
+    max_nodes_to_display: Optional[int] = 200
 ):
-    if communities is None or len(communities.membership) == 0:
+    if communities is None or not communities.membership:
         return None
+
+    num_total_nodes = len(communities.membership)
+    if num_total_nodes == 0:
+        return None
+
+    # 1. Calculate degrees for all nodes based on the undirected graph pyvis will render
+    actual_degrees = [0] * num_total_nodes
+    processed_edges: set[Tuple[int, int]] = set()
+    
+    s_nodes, t_nodes = adj_matrix_sparse.nonzero()
+    for s_orig, t_orig in zip(s_nodes, t_nodes):
+        s_int, t_int = int(s_orig), int(t_orig)
+        if s_int != t_int: # Ignore self-loops
+            u, v = min(s_int, t_int), max(s_int, t_int)
+            if u < num_total_nodes and v < num_total_nodes: # Ensure indices are valid for communities/chunks
+                processed_edges.add((u, v))
+
+    for u, v in processed_edges:
+        actual_degrees[u] += 1
+        actual_degrees[v] += 1
+
+    # 2. Determine sampled_node_original_indices
+    sampled_node_original_indices: List[int]
+    if max_nodes_to_display is not None and num_total_nodes > max_nodes_to_display:
+        sorted_original_indices = sorted(
+            range(num_total_nodes),
+            key=lambda i: actual_degrees[i],
+            reverse=True
+        )
+        sampled_node_original_indices = sorted_original_indices[:max_nodes_to_display]
+    else:
+        sampled_node_original_indices = list(range(num_total_nodes))
+
+    if not sampled_node_original_indices:
+        return None # No nodes to plot
+
+    # Sort for consistent pyvis_id assignment if the same set of nodes is chosen
+    sampled_node_original_indices.sort() 
+    
+    original_to_pyvis_id = {
+        orig_idx: new_idx for new_idx, orig_idx in enumerate(sampled_node_original_indices)
+    }
 
     # Create a pyvis network
     net = Network(notebook=True, height="750px", width="100%", cdn_resources='remote', directed=False)
 
-    # Add nodes
+    # Add sampled nodes
     node_colors = ['#FF5733', '#33FF57', '#3357FF', '#FF33A1', '#A133FF', '#33FFA1']
-    for i, membership_id in enumerate(communities.membership):
-        chunk_preview = chunks[i][:50] + "..." if len(chunks[i]) > 50 else chunks[i]
+    for pyvis_idx, original_idx in enumerate(sampled_node_original_indices):
+        if original_idx >= len(communities.membership) or original_idx >= len(chunks) or original_idx >= len(chunk_to_pdf_map):
+            # This should ideally not happen if inputs are consistent and checks above are robust
+            continue
+
+        membership_id = communities.membership[original_idx]
+        chunk_text = chunks[original_idx]
+        chunk_preview = chunk_text[:50] + "..." if len(chunk_text) > 50 else chunk_text
+        # Get PDF name
+        pdf_name_for_node = chunk_to_pdf_map[original_idx]
+
         net.add_node(
-            int(i),  # Ensure node ID is a standard Python int
-            label=f"Chunk {i}",
-            title=f"Community: {membership_id}\nText: {chunk_preview}", # Tooltip
+            pyvis_idx,  # Use the new, contiguous pyvis_id
+            label=f"Chunk {original_idx}", # Label refers to original identifier
+            title=(
+                f"Original Index: {original_idx}\n"
+                f"Community: {membership_id}\n"
+                f"Degree: {actual_degrees[original_idx]}\n"
+                f"Source PDF: {pdf_name_for_node}\n" # Add source PDF to tooltip
+                f"Text: {chunk_preview}"
+            ),
             color=node_colors[membership_id % len(node_colors)],
-            group=int(membership_id) # Ensure group ID is a standard Python int
+            group=int(membership_id)
         )
 
-    # Add edges from the adjacency matrix (only if they connect nodes within a certain proximity)
-    sources, targets = adj_matrix_sparse.nonzero()
-    # Optional: Get weights if you want to vary edge thickness/color
-    # weights = adj_matrix_sparse[sources, targets] if hasattr(adj_matrix_sparse, '__getitem__') else [1] * len(sources)
-
-    for i in range(len(sources)):
-        # Add edges if they are not self-loops (though kneighbors_graph shouldn't produce them unless k=0)
-        if sources[i] != targets[i]:
-            # Pyvis might re-add nodes if they don't exist, but we added them all.
-            net.add_edge(int(sources[i]), int(targets[i])) # Ensure edge node IDs are standard Python ints
+    # Add edges connecting the sampled nodes
+    for s_orig, t_orig in processed_edges:
+        if s_orig in original_to_pyvis_id and t_orig in original_to_pyvis_id:
+            pyvis_s = original_to_pyvis_id[s_orig]
+            pyvis_t = original_to_pyvis_id[t_orig]
+            net.add_edge(pyvis_s, pyvis_t)
 
     # Configure physics for better layout initially
-    net.force_atlas_2based(gravity=-50, central_gravity=0.01, spring_length=100, spring_strength=0.08, damping=0.4)
+    if net.nodes: # Only apply physics if there are nodes
+        net.force_atlas_2based(gravity=-50, central_gravity=0.01, spring_length=100, spring_strength=0.08, damping=0.4)
     # net.show_buttons(filter_=['physics']) # Can add buttons for user to toggle physics
 
     # Ensure the output directory exists (e.g., a 'temp' folder in your project root)
@@ -56,8 +113,13 @@ def create_interactive_community_graph(
         os.makedirs(temp_dir)
     full_path = os.path.join(temp_dir, output_filename)
     
-    net.save_graph(full_path)
-    return full_path
+    try:
+        net.save_graph(full_path)
+        return full_path
+    except Exception:
+        if not net.nodes: # Common case for error if pyvis can't save an empty graph
+            return None 
+        raise # Re-raise other unexpected errors
 
 def plot_term_correlation_heatmap(chunks_by_community: Dict[int, List[str]], top_n_terms: int = 20):
     """

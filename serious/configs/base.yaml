@@ -6,8 +6,8 @@ log_level: "INFO" # DEBUG, INFO, WARNING, ERROR
 
 # --- PDF Processing ---
 pdf_processor:
-  chunk_size: 1000      # Max characters per text chunk
-  chunk_overlap: 150    # Characters overlap between chunks
+  chunk_size: 500      # Max characters per text chunk
+  chunk_overlap: 100    # Characters overlap between chunks
 
 # --- Embedding Generation ---
 embedding_generator:
@@ -19,14 +19,16 @@ embedding_generator:
 # --- FAISS Indexing ---
 faiss_indexer:
   dim: 384              # Embedding dimension (all-MiniLM-L6-v2 outputs 384)
-  m: 16                 # Number of sub-quantizers for PQ (power of 2 is common)
-  nbits: 8              # Bits per sub-quantizer index (typically 8)
+  m: 8                 # Number of sub-quantizers for PQ (power of 2 is common)
+  nbits: 8
+  nlist: 16              # Bits per sub-quantizer index (typically 8)
   k_search: 5           # Default number of nearest neighbors to retrieve in search
 
 # --- Community Detection (GALA-Louvain CPU Adaptation) ---
 community_detector:
-  n_neighbors: 10       # K for KNN graph construction (ensure < number of samples)
-  use_weights: false    # Whether to use distance as edge weights for Louvain
+  n_neighbors: 5       # K for KNN graph construction (ensure < number of samples)
+  use_weights: false
+  hnsw: True    # Whether to use distance as edge weights for Louvain
   # resolution_parameter: 1.0 # For Louvain, if igraph supports it directly or needs custom handling
 
 # --- Streamlit UI ---
@@ -42,7 +44,8 @@ benchmark:
 
 # --- OpenAI API (If used for question generation - Placeholder) ---
 openai:
-  api_key: "YOUR_OPENAI_API_KEY_HERE" # Replace with actual key or use environment variables
+  # API key is now expected to be loaded from the .env file via OPENAI_API_KEY environment variable
+  api_key: null # Or you can remove this line entirely
   model: "gpt-4o-mini" # or "gpt-4"
   temperature: 0.7
   max_tokens: 250
