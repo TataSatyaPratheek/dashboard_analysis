@@ -1,0 +1,49 @@
+# configs/base.yaml
+
+# --- General Application Settings ---
+app_name: "SEO Dashboard Analyzer"
+log_level: "INFO" # DEBUG, INFO, WARNING, ERROR
+
+# --- PDF Processing ---
+pdf_processor:
+  chunk_size: 1000      # Max characters per text chunk
+  chunk_overlap: 150    # Characters overlap between chunks
+
+# --- Embedding Generation ---
+embedding_generator:
+  model_name: 'all-MiniLM-L6-v2' # Sentence Transformer model
+  # model_name: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2' # Alternative
+  # For M1, ensure PyTorch is configured for MPS if using sentence-transformers
+  batch_size: 32        # Batch size for encoding (if model supports batching)
+
+# --- FAISS Indexing ---
+faiss_indexer:
+  dim: 384              # Embedding dimension (all-MiniLM-L6-v2 outputs 384)
+  m: 16                 # Number of sub-quantizers for PQ (power of 2 is common)
+  nbits: 8              # Bits per sub-quantizer index (typically 8)
+  k_search: 5           # Default number of nearest neighbors to retrieve in search
+
+# --- Community Detection (GALA-Louvain CPU Adaptation) ---
+community_detector:
+  n_neighbors: 10       # K for KNN graph construction (ensure < number of samples)
+  use_weights: false    # Whether to use distance as edge weights for Louvain
+  # resolution_parameter: 1.0 # For Louvain, if igraph supports it directly or needs custom handling
+
+# --- Streamlit UI ---
+streamlit_ui:
+  title: "Advanced SEO Insight Analyzer"
+  max_upload_size_mb: 200 # Max PDF upload size for Streamlit
+
+# --- Benchmarking ---
+benchmark:
+  num_test_vectors: 10000
+  num_query_vectors: 100
+  pdf_test_file: "data/sample_benchmark.pdf" # Path to a sample PDF for benchmarking
+
+# --- OpenAI API (If used for question generation - Placeholder) ---
+openai:
+  api_key: "YOUR_OPENAI_API_KEY_HERE" # Replace with actual key or use environment variables
+  model: "gpt-4o-mini" # or "gpt-4"
+  temperature: 0.7
+  max_tokens: 250
+

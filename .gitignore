@@ -1,1 +1,3 @@
 /not_serious
+*__pycache__
+.coverage*

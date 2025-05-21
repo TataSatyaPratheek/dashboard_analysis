@@ -1,0 +1,33 @@
+# configs/m1_optim.yaml
+# Overrides for M1-specific performance or resource management.
+
+# --- Embedding Generation ---
+embedding_generator:
+  # M1 with MPS might handle batching efficiently, adjust if needed
+  # model_name: 'all-MiniLM-L6-v2' # No change usually needed if PyTorch is MPS-aware
+  batch_size: 64 # Potentially larger batch size if M1 unified memory handles it well
+
+# --- FAISS Indexing ---
+faiss_indexer:
+  # M1 memory is unified, but still limited. Smaller m or nbits might be considered for very large datasets on low-RAM M1s.
+  # For an 8GB M1 Air, the base.yaml settings should be fine for moderately sized datasets.
+  # m: 8 # Example: reduce m if memory becomes an issue on 8GB RAM for very large indices
+  # nbits: 8 # Usually 8 bits is a good trade-off
+
+# --- Community Detection ---
+community_detector:
+  # n_neighbors can be sensitive to dataset size and structure.
+  # No specific M1 change here, but good to tune based on data.
+  pass # No M1 specific changes here, relies on efficient igraph/numpy
+
+# --- Benchmarking ---
+benchmark:
+  # If M1 is slower on certain ops, reduce test vector size for quicker benchmarks
+  # num_test_vectors: 5000
+  pass # Usually no change needed unless benchmarking takes too long
+
+# Note: True M1 optimization often comes from:
+# 1. Using versions of libraries (PyTorch, TensorFlow, NumPy) compiled with M1 support (e.g., Accelerate framework, Metal Performance Shaders).
+# 2. Ensuring FAISS is compiled against an M1-optimized BLAS library.
+# 3. Python itself being an arm64 build.
+# These YAML files primarily control algorithmic parameters that can be tuned for performance/resource tradeoffs.

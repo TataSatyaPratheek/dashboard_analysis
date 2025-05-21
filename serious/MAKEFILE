@@ -1,0 +1,14 @@
+install:  ## Install with M1-optimized dependencies
+    CMAKE_ARGS="-DFAISS_OPT_LEVEL=avx2" pip install -r requirements.txt
+
+process:  ## Run full processing pipeline
+    python -m src.core.pdf --input data/raw/*.pdf
+
+serve:  ## Launch Streamlit UI
+    streamlit run src/ui/app.py
+
+test:  ## Run all tests with coverage
+    pytest tests/ --cov=src --cov-report=term-missing
+
+benchmark:  ## Run performance benchmarks
+    python scripts/benchmark.py --runs 100
