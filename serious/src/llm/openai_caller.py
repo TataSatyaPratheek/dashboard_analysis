@@ -103,6 +103,57 @@ Questions:
 """
         return prompt
 
+    def _create_prompt_for_community_summary(self, community_texts: List[str], community_id: Optional[Any] = None, source_pdfs: Optional[List[str]] = None) -> str:
+        """Creates a prompt to generate a summary for a community of texts."""
+        intro = f"The following text excerpts belong to a detected community (ID: {community_id if community_id else 'N/A'})."
+        if source_pdfs:
+            unique_sources = list(set(source_pdfs))
+            if unique_sources: # Only add if there are actual source PDFs provided
+                intro += f" These texts are derived from the following document(s): {', '.join(unique_sources)}."
+        intro += "\n\nText Excerpts:\n"
+
+        excerpts_str = ""
+        # Use up to 5 excerpts for the prompt, and truncate each if too long
+        for i, text in enumerate(community_texts[:5]):
+            preview = text[:250] + "..." if len(text) > 250 else text # Max length for an excerpt in the prompt
+            excerpts_str += f"Excerpt {i+1}: \"{preview}\"\n"
+
+        prompt = f"""{intro}{excerpts_str}
+Based on these related text excerpts, please provide a concise summary (around 100-150 words) covering:
+- The primary themes or topics discussed in this community.
+- The key insights or conclusions that can be drawn from these texts.
+- The apparent rationale or purpose of this cluster of information.
+
+Summary:""" # Removed the trailing newline from "Summary:\n" to "Summary:" for potentially better model adherence
+        return prompt
+
+    # Inside OpenAIQuestionGenerator class [5]
+    def _create_prompt_for_cross_community_correlation(
+        self,
+        summary_A: str, community_A_id: Any, source_pdfs_A: List[str],
+        summary_B: str, community_B_id: Any, source_pdfs_B: List[str],
+        num_questions: int = 3
+    ) -> str:
+        unique_sources_A = list(set(source_pdfs_A))
+        unique_sources_B = list(set(source_pdfs_B))
+
+        prompt = f"""Consider two distinct communities of information:
+Community {community_A_id} (Sources: {', '.join(unique_sources_A) if unique_sources_A else 'N/A'}):
+Summary: "{summary_A}"
+
+Community {community_B_id} (Sources: {', '.join(unique_sources_B) if unique_sources_B else 'N/A'}):
+Summary: "{summary_B}"
+
+Based on these summaries and their source document context, generate {num_questions} insightful questions that explore potential correlations, comparisons, or relationships between these two communities. Focus on:
+- Shared themes or contrasting viewpoints.
+- Potential causal links or interdependencies if applicable (e.g., if one discusses a problem and another a solution).
+- How insights from one community might inform or impact the other, especially considering they may span different documents or sections of the same document(s).
+- Questions that would require looking at data from both underlying sets of documents to answer.
+
+Correlation Questions:
+"""
+        return prompt
+
     # --- Parsing Method (unchanged, but used by both sync and async) ---
     def _parse_openai_response(self, content: str) -> List[str]:
         questions = [q.strip() for q in content.split('\n') if q.strip() and not q.strip().isnumeric()]
@@ -193,6 +244,63 @@ Questions:
             print(f"Error during OpenAI API call for community: {e}")
             return [f"Error generating community questions: {e}"]
 
+    # Synchronous version
+    def generate_summary_for_community_texts(
+        self, community_texts: List[str], community_id: Optional[Any] = None, source_pdfs: Optional[List[str]] = None
+    ) -> str:
+        if not self.client:
+            return "Error: OpenAI client not initialized."
+        if not community_texts:
+            return "Error: No texts provided for summarization."
+
+        prompt = self._create_prompt_for_community_summary(community_texts, community_id, source_pdfs)
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant skilled at summarizing thematic text clusters."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.temperature, # Can be lower for summaries, e.g., 0.3-0.5
+                max_tokens=self.max_tokens * 2 # Allow more tokens for a summary
+            )
+            summary = response.choices[0].message.content.strip()
+            return summary
+        except Exception as e:
+            print(f"Error during OpenAI API call for community summary: {e}")
+            return f"Error generating summary: {e}"
+
+    # Synchronous version
+    def generate_correlation_questions(
+        self,
+        summary_A: str, community_A_id: Any, source_pdfs_A: List[str],
+        summary_B: str, community_B_id: Any, source_pdfs_B: List[str],
+        num_questions: int = 3
+    ) -> List[str]:
+        if not self.client:
+            return ["Error: OpenAI client not initialized."]
+
+        prompt = self._create_prompt_for_cross_community_correlation(
+            summary_A, community_A_id, source_pdfs_A,
+            summary_B, community_B_id, source_pdfs_B,
+            num_questions
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are skilled at generating analytical questions about relationships between different information sets."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.temperature, # Higher temperature might be good for creative correlation questions
+                max_tokens=self.max_tokens * num_questions
+            )
+            content = response.choices[0].message.content.strip()
+            return self._parse_openai_response(content) # Use existing parser
+        except Exception as e:
+            print(f"Error during OpenAI API call for correlation questions: {e}")
+            return [f"Error generating correlation questions: {e}"]
+
     # --- New Asynchronous Methods ---
     async def _async_generate_for_one_item(
         self, item_id: Any, prompt: str, num_questions: int
@@ -219,6 +327,31 @@ Questions:
             except Exception as e:
                 print(f"Error during async OpenAI API call for item {item_id}: {e}")
                 return item_id, [f"Error generating questions for item {item_id}: {e}"]
+
+    # Asynchronous helper for batch summarization
+    async def _async_generate_summary_for_one_community(
+        self, community_id: Any, community_texts: List[str], source_pdfs: Optional[List[str]] = None
+    ) -> Tuple[Any, str]:
+        if not self.async_client:
+            return community_id, "Error: Async OpenAI client not initialized."
+        if not community_texts:
+            return community_id, "Error: No texts provided."
+
+        prompt = self._create_prompt_for_community_summary(community_texts, community_id, source_pdfs)
+        async with self.semaphore: # Limit concurrent requests
+            try:
+                response = await self.async_client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are an assistant skilled at summarizing text clusters."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=self.temperature, max_tokens=self.max_tokens * 2
+                )
+                summary = response.choices[0].message.content.strip()
+                return community_id, summary
+            except Exception as e:
+                return community_id, f"Error generating summary for community {community_id}: {e}"
 
     async def async_generate_questions_from_summaries(
         self, summaries_with_ids: List[Tuple[Any, str]], num_questions_per_summary: int = 3
@@ -277,6 +410,25 @@ Questions:
         
         return {item_id: questions for item_id, questions in results_with_ids}
 
+    # Batch asynchronous summarization
+    async def async_generate_summaries_for_communities(
+        self, communities_data: List[Dict[str, Any]] # Each dict: {"id": Any, "texts": List[str], "source_pdfs": List[str]}
+    ) -> Dict[Any, str]:
+        if not self.async_client:
+            return {data["id"]: "Error: Async OpenAI client not initialized." for data in communities_data}
+
+        tasks = [
+            self._async_generate_summary_for_one_community(
+                data["id"], data["texts"], data.get("source_pdfs")
+            ) for data in communities_data if data.get("texts")
+        ]
+        results_with_ids = await asyncio.gather(*tasks)
+        return {item_id: summary for item_id, summary in results_with_ids}
+
     async def _return_empty_for_item(self, item_id: Any) -> Tuple[Any, List[str]]:
         """Helper for asyncio.gather to return an empty list for an item."""
         return item_id, []
+
+    async def _return_error_for_item(self, item_id: Any, error_message: str) -> Tuple[Any, str]:
+        """Helper for asyncio.gather to return an error string for an item."""
+        return item_id, f"Error: {error_message}"

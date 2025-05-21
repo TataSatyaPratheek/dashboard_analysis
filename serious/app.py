@@ -1,5 +1,6 @@
 # src/ui/app.py
 import asyncio
+import hashlib
 import io
 import os
 import time
@@ -26,9 +27,10 @@ from src import (
     plot_term_correlation_heatmap,
     plot_term_trends
 )
+from src.citation.citation_tracker import CitationTracker, format_response_with_citations_ui
 
 # --- UI Helper Imports ---
-def display_communities_info(communities, chunks, chunk_to_pdf_map): # Added chunk_to_pdf_map
+def display_communities_info(communities, chunks, chunk_to_pdf_map, app_config): # Added chunk_to_pdf_map and app_config
     if communities is None:
         st.warning("Community detection could not be performed (e.g., too few items).")
         return
@@ -41,6 +43,76 @@ def display_communities_info(communities, chunks, chunk_to_pdf_map): # Added chu
             for item_index in community_indices[:min(5, len(community_indices))]:
                 pdf_name = chunk_to_pdf_map[item_index] # Get source PDF
                 st.caption(f"- Chunk {item_index} (from: {pdf_name}): {chunks[item_index][:150]}...")
+            
+            st.markdown("---") # Separator
+
+            # Get source PDFs for this community's chunks
+            current_community_source_pdfs = [
+                chunk_to_pdf_map[chunk_idx] 
+                for chunk_idx in community_indices 
+                if chunk_idx < len(chunk_to_pdf_map)
+            ]
+            unique_source_pdfs = sorted(list(set(current_community_source_pdfs)))
+            if unique_source_pdfs:
+                st.markdown(f"**Source Document(s):** {', '.join(unique_source_pdfs)}")
+
+            # Display existing summary or button to generate
+            if i in st.session_state.global_community_summaries:
+                summary_data = st.session_state.global_community_summaries[i]
+                st.markdown("**Summary:**")
+                # Check if summary_data is in the new dictionary format
+                if isinstance(summary_data, dict) and "summary" in summary_data and "source_chunk_hashes" in summary_data:
+                    # Use the new UI-specific formatting function.
+                    # Assumes st.session_state.citation_tracker is initialized (as it is in main()).
+                    formatted_summary = format_response_with_citations_ui(
+                        summary_data["summary"],
+                        summary_data["source_chunk_hashes"],
+                        st.session_state.citation_tracker
+                    )
+                    st.markdown(formatted_summary) # Use markdown to render newlines and bold
+                else: # Fallback for old format or incomplete data
+                    st.info(str(summary_data)) # Display raw data if not in expected dict format
+            else:
+                if st.button(f"Summarize Community {i+1}", key=f"summarize_comm_global_{i}"):
+                    cfg_openai = getattr(app_config, 'openai', {})
+                    # Initialize OpenAI question generator for summarization
+                    q_generator = initialize_openai_question_generator(
+                        model=getattr(cfg_openai, 'model', 'gpt-4o-mini'),
+                        temperature=0.4, # Potentially lower temp for summaries
+                        max_tokens=getattr(cfg_openai, 'max_tokens', 200) * 2 
+                    )
+                    
+                    # Get texts for summary from the global chunks list
+                    community_texts_for_summary = [
+                        chunks[chunk_idx] 
+                        for chunk_idx in community_indices
+                        if chunk_idx < len(chunks)
+                    ]
+                    community_chunk_hashes_for_summary = []
+                    for chunk_idx_global in community_indices:
+                        if chunk_idx_global < len(chunks): # chunks is global_all_chunks
+                            chunk_text = chunks[chunk_idx_global]
+                            # Re-calculate hash for the chunk to store with the summary
+                            chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest() 
+                            community_chunk_hashes_for_summary.append(chunk_hash)
+
+                    if community_texts_for_summary:
+                        with st.spinner("Generating summary..."):
+                            summary_text = q_generator.generate_summary_for_community_texts(
+                                community_texts_for_summary, 
+                                community_id=f"Global Community {i+1}",
+                                source_pdfs=unique_source_pdfs # Pass the unique source PDFs for this community
+                            )
+                            if not summary_text.startswith("Error:"):
+                                st.session_state.global_community_summaries[i] = {
+                                    "summary": summary_text, # Store as dict
+                                    "source_chunk_hashes": community_chunk_hashes_for_summary
+                                }
+                                st.rerun()
+                            else:
+                                st.error(summary_text)
+                    else:
+                        st.warning("No text found for this community to summarize.")
 
 
 def visualize_graph_placeholder(embeddings, communities):
@@ -168,6 +240,16 @@ def display_processing_section(app_config):
                         )
                         chunks = process_pdf(processor, file_bytes, file_name) # process_pdf uses filename for cache key
 
+                        # Add chunks to citation tracker
+                        if chunks:
+                            if "citation_tracker" not in st.session_state: # Should be initialized by main
+                                st.session_state.citation_tracker = CitationTracker()
+                            for chunk_idx_in_pdf, chunk_text_from_pdf in enumerate(chunks):
+                                st.session_state.citation_tracker.add_chunk(
+                                    chunk_text_from_pdf,
+                                    dashboard_id=file_name, 
+                                    chunk_idx=chunk_idx_in_pdf)
+
                         if not chunks:
                             st.error(f"No text extracted from '{file_name}'.")
                             st.session_state.processed_documents_data[file_name] = {'chunks': [], 'embeddings': None, 'name': file_name}
@@ -209,6 +291,27 @@ def display_processing_section(app_config):
                         st.session_state.global_all_embeddings = np.vstack(temp_all_embeddings_list)
                         st.session_state.global_chunk_to_pdf_map = temp_chunk_to_pdf_map
 
+                        # --- Populate CitationTracker for ALL global chunks ---
+                        # Reset/Reinitialize the tracker to ensure it only contains chunks
+                        # from the current set of globally processed documents.
+                        st.session_state.citation_tracker = CitationTracker()
+
+                        # Iterate through all documents that contributed to the global_all_chunks
+                        # and add their individual chunks to the citation tracker.
+                        # This ensures that the tracker has the correct source PDF and
+                        # local chunk index for every chunk hash.
+                        # current_global_chunk_offset = 0 # Not strictly needed for add_chunk
+                        for fname_doc, data_dict_doc in st.session_state.processed_documents_data.items():
+                            if data_dict_doc.get('chunks'):
+                                for local_chunk_idx, chunk_text_content in enumerate(data_dict_doc['chunks']):
+                                    st.session_state.citation_tracker.add_chunk(
+                                        chunk=chunk_text_content,
+                                        dashboard_id=fname_doc,
+                                        chunk_idx=local_chunk_idx # Index within its own PDF
+                                    )
+                                # current_global_chunk_offset += len(data_dict_doc['chunks'])
+                        # --- END CitationTracker Population ---
+
                         st.info(f"Total embeddings for global index: {st.session_state.global_all_embeddings.shape[0]}")
 
                         # Build/Rebuild Global FAISS Index
@@ -248,7 +351,9 @@ def display_processing_section(app_config):
         if st.button("Clear All Processed Data & Index", key="clear_all_button"):
             keys_to_clear = [
                 "processed_documents_data", "global_all_chunks", "global_all_embeddings",
-                "global_faiss_indexer", "global_communities_detected", "global_chunk_to_pdf_map"
+                "global_faiss_indexer", "global_communities_detected", "global_chunk_to_pdf_map",
+                "global_community_summaries", "global_correlation_questions", "citation_tracker"
+
             ]
             for key in keys_to_clear:
                 if key in st.session_state:
@@ -278,7 +383,7 @@ def display_visualization_section(app_config, global_chunks, global_embeddings, 
     num_docs = len(st.session_state.processed_documents_data)
     st.caption(f"Based on {num_docs} document(s) | Total individual processing time: {total_processing_time:.2f} seconds")
 
-    display_communities_info(global_communities, global_chunks, global_chunk_map)
+    display_communities_info(global_communities, global_chunks, global_chunk_map, app_config)
     
     # --- Interactive Community Graph Visualization ---
     if global_communities and global_embeddings.shape[0] > 1:
@@ -415,6 +520,18 @@ def question_generation_fragment_content(app_config):
                 st.warning("Selected aggregated community has no text to process.")
                 return
 
+            # Generate hashes for the chunks that form community_actual_texts
+            community_chunk_hashes_for_questions = []
+            # These are the global indices of the chunks that are actually part of this community's texts
+            # and are valid within global_chunks.
+            valid_global_indices_for_community = [
+                idx for idx in selected_community_member_indices if idx < len(global_chunks)
+            ]
+            for original_global_chunk_idx in valid_global_indices_for_community:
+                chunk_text_for_hash = global_chunks[original_global_chunk_idx] # global_chunks is st.session_state.global_all_chunks
+                chunk_hash = hashlib.sha256(chunk_text_for_hash.encode()).hexdigest()
+                community_chunk_hashes_for_questions.append(chunk_hash)
+
             generated_questions = None
             used_llm = None
             openai_success = False
@@ -467,11 +584,20 @@ def question_generation_fragment_content(app_config):
             if generated_questions:
                 st.subheader(f"Generated Qs (Agg. Comm. {selected_idx + 1}):")
                 if used_llm: st.caption(f"(Using {used_llm})")
+
                 if isinstance(generated_questions, list) and generated_questions and generated_questions[0].startswith("Error:"):
                     st.error("\n".join(generated_questions))
-                else:
-                    for q_idx, q_text in enumerate(generated_questions):
-                        st.markdown(f"{q_idx + 1}. {q_text}")
+                # If generated_questions is a list and not an error list, and it's not empty.
+                elif isinstance(generated_questions, list) and generated_questions:
+                    # All questions from this community share the same source_chunk_hashes.
+                    formatted_question_block = format_response_with_citations_ui(
+                        "\n".join([f"{q_idx+1}. {q_text}" for q_idx, q_text in enumerate(generated_questions)]), # Join all questions into one block
+                        community_chunk_hashes_for_questions, # Associate with all source chunks of the community
+                        st.session_state.citation_tracker
+                    )
+                    st.markdown(formatted_question_block, unsafe_allow_html=True)
+                elif generated_questions: # Handle cases where generated_questions might be a single error string
+                    st.error(str(generated_questions))
             else:
                 st.warning("No questions were generated for the aggregated community.")
 
@@ -558,6 +684,111 @@ def display_search_section(app_config, global_chunks, global_indexer, global_chu
         st.warning("Embedding model not ready. Cannot perform search.")
 
 
+@st.fragment
+def display_correlation_analysis_section(app_config):
+    st.header("Cross-Community Correlation Analysis (Aggregated)")
+
+    if not st.session_state.get("global_communities_detected") or \
+       len(st.session_state.global_communities_detected) < 2:
+        st.info("At least two global communities must be detected to perform correlation analysis.")
+        return
+
+    global_communities = st.session_state.global_communities_detected
+    community_options = [f"Global Community {i+1} ({len(members)} items)" for i, members in enumerate(global_communities)]
+    
+    # Ensure summaries are generated or can be generated for selected communities
+    # This could be coupled with the summarization UI: if a summary isn't ready, prompt to generate it.
+
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_comm_A_str = st.selectbox("Select First Community:", community_options, key="corr_comm_A_select")
+    with col2:
+        available_options_B = [opt for opt in community_options if opt != selected_comm_A_str]
+        if not available_options_B: # Should not happen if len(communities) >= 2
+            st.warning("Not enough distinct communities to select a second one.")
+            return
+        selected_comm_B_str = st.selectbox("Select Second Community:", available_options_B, key="corr_comm_B_select")
+
+    if selected_comm_A_str and selected_comm_B_str:
+        idx_A = community_options.index(selected_comm_A_str)
+        idx_B = community_options.index(selected_comm_B_str)
+
+        # Check if summaries are available, prompt to generate if not
+        summary_A = st.session_state.global_community_summaries.get(idx_A)
+        summary_B = st.session_state.global_community_summaries.get(idx_B)
+
+        if not summary_A:
+            st.warning(f"Summary for {selected_comm_A_str} not yet generated. Please generate it first from the community list above.")
+        if not summary_B:
+            st.warning(f"Summary for {selected_comm_B_str} not yet generated. Please generate it first.")
+        
+        if summary_A and summary_B:
+            if st.button(f"Generate Correlation Questions between Comm. {idx_A+1} & {idx_B+1}", key=f"gen_corr_q_{idx_A}_{idx_B}"):
+                cfg_openai = getattr(app_config, 'openai', {})
+                q_generator = initialize_openai_question_generator(
+                    model=getattr(cfg_openai, 'model', 'gpt-4o-mini'),
+                    temperature=0.7, # Potentially higher for more exploratory questions
+                    max_tokens=getattr(cfg_openai, 'max_tokens', 200) 
+                )
+                
+                # Get source PDFs for community A
+                source_pdfs_A_list = [
+                    st.session_state.global_chunk_to_pdf_map[chunk_idx] 
+                    for chunk_idx in global_communities[idx_A]
+                    if chunk_idx < len(st.session_state.global_chunk_to_pdf_map)
+                ]
+                # Get source PDFs for community B
+                source_pdfs_B_list = [
+                    st.session_state.global_chunk_to_pdf_map[chunk_idx] 
+                    for chunk_idx in global_communities[idx_B]
+                    if chunk_idx < len(st.session_state.global_chunk_to_pdf_map)
+                ]
+
+                with st.spinner(f"Generating correlation questions for Comm. {idx_A+1} and Comm. {idx_B+1}..."):
+                    # Assuming q_generator has a method generate_correlation_questions
+                    # This method needs to be implemented in your OpenAIQuestionGenerator class
+                    corr_questions = q_generator.generate_correlation_questions(
+                        summary_A, f"Global Community {idx_A+1}", list(set(source_pdfs_A_list)), # Pass unique source PDFs
+                        summary_B, f"Global Community {idx_B+1}", list(set(source_pdfs_B_list)), # Pass unique source PDFs
+                        num_questions=3 
+                    )
+                    
+                    st.session_state.global_correlation_questions[(idx_A, idx_B)] = corr_questions
+                    if corr_questions and (not isinstance(corr_questions, list) or not corr_questions[0].startswith("Error:")):
+                        st.success("Correlation questions generated!")
+                    else:
+                        st.error(f"Failed to generate correlation questions: {corr_questions[0] if corr_questions and isinstance(corr_questions, list) else 'Unknown error'}")
+                    st.rerun() 
+
+            current_pair_questions = st.session_state.global_correlation_questions.get((idx_A, idx_B))
+            if current_pair_questions:
+                st.subheader(f"Correlation Questions for Comm. {idx_A+1} & {idx_B+1}:")
+                # The sources are the chunks that formed summary_A and summary_B
+                summary_A_data = st.session_state.global_community_summaries.get(idx_A, {})
+                summary_B_data = st.session_state.global_community_summaries.get(idx_B, {})
+
+                combined_source_hashes = []
+                if isinstance(summary_A_data, dict) and "source_chunk_hashes" in summary_A_data:
+                    combined_source_hashes.extend(summary_A_data["source_chunk_hashes"])
+                if isinstance(summary_B_data, dict) and "source_chunk_hashes" in summary_B_data:
+                    combined_source_hashes.extend(summary_B_data["source_chunk_hashes"])
+
+                # Remove duplicates if chunks overlap between source communities of summaries
+                unique_combined_hashes = sorted(list(set(combined_source_hashes)))
+
+                if isinstance(current_pair_questions, list) and current_pair_questions and not current_pair_questions[0].startswith("Error:"):
+                    # Format all questions together with the combined citations
+                    question_block_text = "\n".join([f"{q_idx+1}. {q_text}" for q_idx, q_text in enumerate(current_pair_questions)])
+                    formatted_block = format_response_with_citations_ui(
+                        question_block_text,
+                        unique_combined_hashes,
+                        st.session_state.citation_tracker
+                    )
+                    st.markdown(formatted_block)
+                else: # Handle errors or empty list
+                    st.error("\n".join(current_pair_questions) if isinstance(current_pair_questions, list) else str(current_pair_questions))
+
+
 def main():
     app_config = load_config()
     dotenv_path = "/Users/vi/Documents/work/dashboard_analysis/serious/.env" # Ensure this path is correct or use relative path
@@ -581,6 +812,17 @@ def main():
         st.session_state.global_chunk_to_pdf_map = []
     if "trigger_global_rebuild" not in st.session_state: # Flag to signal need for global data aggregation
         st.session_state.trigger_global_rebuild = False
+    # In main() function of app.py [9]
+    # ... existing global session state ...
+    if "global_community_summaries" not in st.session_state:
+        # Stores {community_idx: {"summary": "text", "source_chunk_hashes": [...]}}
+        st.session_state.global_community_summaries = {}
+    if "global_correlation_questions" not in st.session_state:
+        # Stores { (comm_idx_A, comm_idx_B): ["question1", "question2"] }
+        st.session_state.global_correlation_questions = {}
+    if "citation_tracker" not in st.session_state:
+        st.session_state.citation_tracker = CitationTracker()
+
     
     display_processing_section(app_config)
 
@@ -602,6 +844,10 @@ def main():
                                st.session_state.global_faiss_indexer,
                                st.session_state.global_chunk_to_pdf_map)
 
+        if st.session_state.get("global_faiss_indexer") is not None: # Ensure global data is ready
+            display_correlation_analysis_section(app_config)
+
+
         @st.fragment
         def display_question_generation_sidebar_wrapper(config):
             question_generation_fragment_content(config)
@@ -612,341 +858,6 @@ def main():
         st.warning("Aggregated data is being prepared or encountered an issue. Please wait or check processing status.")
     else:
         st.info("Upload and process PDF(s) to begin analysis.")
-
-@st.fragment
-def display_visualization_section(app_config):
-    if "processed_data" not in st.session_state or st.session_state.processed_data is None:
-        st.info("Please upload and process a PDF first to see visualizations.")
-        return
-
-    data = st.session_state.processed_data
-    chunks = data["chunks"]
-    embeddings = data["embeddings"]
-    communities = data["communities"]
-
-    st.header("Analysis Results")
-    st.caption(f"Based on: {data['pdf_file_name']} | Total processing time: {data['processing_time']:.2f} seconds")
-
-    display_communities_info(communities, chunks)
-    
-    # --- Interactive Community Graph Visualization ---
-    if communities and embeddings.shape[0] > 1:
-        configured_n_neighbors = app_config.community_detector.n_neighbors
-        max_possible_neighbors = embeddings.shape[0] - 1
-        num_neighbors_for_vis = min(configured_n_neighbors, max_possible_neighbors)
-        num_neighbors_for_vis = max(1, num_neighbors_for_vis)
-
-        adj_matrix_for_vis = None
-        if num_neighbors_for_vis > 0:
-            adj_matrix_for_vis = create_adjacency_matrix(embeddings, num_neighbors_for_vis)
-
-        if adj_matrix_for_vis is not None:
-            st.subheader("Interactive Community Graph")
-            with st.spinner("Generating interactive graph..."):
-                graph_html_path = create_interactive_community_graph(
-                    embeddings, adj_matrix_for_vis, communities, chunks, output_filename="community_graph.html"
-                )
-
-                if graph_html_path and os.path.exists(graph_html_path):
-                    with open(graph_html_path, 'r', encoding='utf-8') as HtmlFile:
-                        source_code = HtmlFile.read()
-                    components.html(source_code, height=800, scrolling=True)
-                elif graph_html_path:
-                    st.error(f"Graph HTML file was expected at '{graph_html_path}' but not found.")
-                else:
-                    st.info("Could not generate community graph.")
-        elif communities:
-             st.info("Graph could not be generated (e.g., too few distinct data points).")
-        elif not communities:
-            st.info("No communities detected, so no community graph to display.")
-
-
-    # --- Term Correlation Heatmap ---
-    if communities:
-        st.subheader("Term Correlation Heatmap")
-        chunks_for_heatmap = {}
-        for i, community_member_indices in enumerate(communities):
-            if communities[i]:
-                chunks_for_heatmap[i] = [chunks[chunk_idx] for chunk_idx in communities[i]]
-
-        if not chunks_for_heatmap:
-            st.info("No textual data in communities to generate heatmap.")
-        else:
-            with st.spinner("Generating correlation heatmap..."):
-                heatmap_config = getattr(app_config, 'term_correlation_heatmap', {})
-                top_n_val = heatmap_config.get('top_n_terms', 15) # Simplified
-                heatmap_fig = plot_term_correlation_heatmap(chunks_for_heatmap, top_n_terms=top_n_val)
-                if heatmap_fig:
-                    st.pyplot(heatmap_fig)
-                else:
-                    st.info("Heatmap could not be generated.")
-
-    # --- Temporal Trend Analysis ---
-    st.subheader("Temporal Trend Analysis")
-    if 'pdf_file_name' in data:
-        try:
-            report_date_str = data['pdf_file_name'].split('_')[-1].split('.')[0]
-            report_date = pd.to_datetime(report_date_str)
-        except Exception:
-            report_date = pd.Timestamp('today')
-
-        dated_chunks_data_for_trend = []
-        if chunks:
-            num_chunks = len(chunks)
-            for i, chunk_text in enumerate(chunks):
-                month_offset = int((i / num_chunks) * 12) if num_chunks > 0 else 0 # num_chunks > 1 to num_chunks > 0
-                current_date = report_date - pd.DateOffset(months=month_offset)
-                dated_chunks_data_for_trend.append({'text': chunk_text, 'date': current_date})
-
-            if dated_chunks_data_for_trend:
-                terms_input = st.text_input("Enter terms for trend (comma-separated):", "seo, keyword, ranking", key="trend_terms_input")
-                if terms_input:
-                    terms_to_plot = [term.strip() for term in terms_input.split(',') if term.strip()]
-                    if terms_to_plot:
-                        with st.spinner("Generating trend plot..."):
-                            trend_fig = plot_term_trends(dated_chunks_data_for_trend, terms_to_plot)
-                            if trend_fig:
-                                st.pyplot(trend_fig)
-                            else:
-                                st.info("Trend plot could not be generated.")
-                    else:
-                        st.info("Please enter valid terms to track.")
-            else:
-                st.info("No data available for trend analysis.")
-    else:
-        st.info("PDF file name not available for temporal trend analysis.")
-
-
-# Moved st.sidebar out of the fragment definition
-# @st.fragment # This decorator applies to the function
-def question_generation_fragment_content(app_config): # Renamed function to reflect it's content for the fragment
-    if "processed_data" not in st.session_state or st.session_state.processed_data is None:
-        st.info("Process a PDF to enable question generation.") # Will appear in sidebar
-        return
-
-    data = st.session_state.processed_data
-    chunks = data["chunks"]
-    communities = data["communities"]
-
-    st.subheader("Generate Questions") # This will now correctly be inside the sidebar
-
-    if not communities or len(communities) == 0:
-        st.info("No communities detected to generate questions for.")
-        return
-
-    community_options = [f"Community {i+1} ({len(members)} items)" for i, members in enumerate(communities)]
-
-    current_selection = st.session_state.get("community_selectbox")
-    current_selection_idx = None
-    if current_selection and current_selection in community_options:
-        current_selection_idx = community_options.index(current_selection)
-
-    selected_community_str = st.selectbox(
-        "Select Community:",
-        community_options,
-        index=current_selection_idx if current_selection_idx is not None else 0,
-        key="community_selectbox"
-    )
-
-    st.selectbox("LLM Generation Attempt Order:", ["OpenAI -> Ollama (Local)"], disabled=True, help="Fallback is automatic.")
-
-    if selected_community_str:
-        selected_idx = community_options.index(selected_community_str)
-        selected_community_member_indices = communities[selected_idx]
-        community_actual_texts = [chunks[i] for i in selected_community_member_indices]
-
-        if st.button("Generate Questions for Selected Community", key=f"gen_q_comm_{selected_idx}"):
-            if not community_actual_texts:
-                st.warning("Selected community has no text to process.")
-                return
-
-            generated_questions = None
-            used_llm = None
-            openai_success = False
-
-            with st.spinner("Attempting question generation with OpenAI..."):
-                try:
-                    cfg_openai = getattr(app_config, 'openai', {})
-                    openai_gen = initialize_openai_question_generator(
-                        model=getattr(cfg_openai, 'model', 'gpt-4o-mini'),
-                        temperature=getattr(cfg_openai, 'temperature', 0.7),
-                        max_tokens=getattr(cfg_openai, 'max_tokens', 200)
-                    )
-                    if openai_gen.client:
-                        q_list = generate_questions_for_community(
-                            openai_gen, community_actual_texts, selected_idx + 1, num_questions=3
-                        )
-                        if isinstance(q_list, list) and (not q_list or not q_list[0].startswith("Error:")):
-                            generated_questions = q_list
-                            used_llm = "OpenAI"
-                            openai_success = True
-                        else:
-                            st.warning(f"OpenAI: {q_list[0] if q_list else 'Failed'}. Fallback...")
-                    else:
-                        st.warning("OpenAI client not init. Fallback...")
-                except Exception as e:
-                    st.warning(f"OpenAI error: {e}. Fallback...")
-
-            if not openai_success:
-                with st.spinner("Attempting question generation with Ollama..."):
-                    try:
-                        cfg_ollama = getattr(app_config, 'ollama', {})
-                        ollama_gen = initialize_ollama_question_generator(
-                            model=getattr(cfg_ollama, 'model', 'llama3.2:latest'),
-                            host=getattr(cfg_ollama, 'host', None)
-                        )
-                        q_list = generate_questions_for_community(
-                            ollama_gen, community_actual_texts, selected_idx + 1, num_questions=3
-                        )
-                        if isinstance(q_list, list) and (not q_list or not q_list[0].startswith("Error:")):
-                            generated_questions = q_list
-                            used_llm = "Ollama"
-                            st.info("Questions generated using local Ollama model.")
-                        else:
-                            st.error(f"Ollama: {q_list[0] if q_list else 'Failed'}")
-                            generated_questions = q_list
-                    except Exception as e:
-                        st.error(f"Ollama error: {e}. Both failed.")
-                        generated_questions = [f"Error: Ollama exception: {e}"]
-
-            # Display results in the sidebar under the button
-            if generated_questions:
-                st.subheader(f"Generated Qs (Community {selected_idx + 1}):")
-                if used_llm: st.caption(f"(Using {used_llm})")
-                if isinstance(generated_questions, list) and generated_questions and generated_questions[0].startswith("Error:"):
-                    st.error("\n".join(generated_questions))
-                else:
-                    for q_idx, q_text in enumerate(generated_questions):
-                        st.markdown(f"{q_idx + 1}. {q_text}")
-            else:
-                st.warning("No questions were generated.")
-
-
-    # --- Batch Question Generation for Top 3 Communities ---
-    st.markdown("---")
-
-    if communities and len(communities) > 0:
-        st.subheader("Batch Generate (Top 3)")
-        if st.button("Generate for Top 3 (Async)", key="batch_gen_q"):
-            batch_community_data = []
-            # Iterate up to the first 3 communities
-            num_to_process = min(len(communities), 3)
-            for i in range(num_to_process):
-                community_member_indices = communities[i] # igraph.VertexClustering supports integer indexing
-                if not community_member_indices: continue # A community (list of indices) could be empty
-                community_actual_texts = [chunks[i_chunk] for i_chunk in community_member_indices]
-                if community_actual_texts:
-                    batch_community_data.append({"id": f"Community {i+1}", "texts": community_actual_texts})
-
-            if not batch_community_data:
-                st.info("No communities with text found in the top 3.")
-            else:
-                with st.spinner("Generating questions for multiple communities asynchronously with OpenAI..."):
-                    cfg_batch = getattr(app_config, 'openai', {})
-                    openai_batch_gen = initialize_openai_question_generator(
-                        model=getattr(cfg_batch, 'model', 'gpt-4o-mini'),
-                        temperature=getattr(cfg_batch, 'temperature', 0.7),
-                        max_tokens=getattr(cfg_batch, 'max_tokens', 200)
-                    )
-
-                    if not hasattr(openai_batch_gen, 'async_generate_questions_from_community_texts_batch') or \
-                       not openai_batch_gen.async_client:
-                        st.error("Async batch generation not supported.")
-                    else:
-                        batch_results = {}
-                        try:
-                            batch_results = asyncio.run(
-                                openai_batch_gen.async_generate_questions_from_community_texts_batch(
-                                    batch_community_data,
-                                    num_questions_per_community=3
-                                )
-                            )
-                        except Exception as e:
-                            st.error(f"Async batch error: {e}")
-
-                        if batch_results:
-                            st.subheader("Batch Qs Results:")
-                            for comm_id, q_list_res in batch_results.items():
-                                st.markdown(f"**{comm_id}**")
-                                if isinstance(q_list_res, list) and q_list_res and q_list_res[0].startswith("Error:"):
-                                    st.error("\n".join(q_list_res))
-                                elif not q_list_res:
-                                    st.info(f"No Qs for {comm_id}.")
-                                else:
-                                    for q_idx, q_text in enumerate(q_list_res):
-                                        st.markdown(f"- {q_text}")
-                                st.markdown("---")
-                        elif batch_community_data:
-                            st.warning("Batch generation produced no results.")
-
-
-@st.fragment
-def display_search_section(app_config):
-    if "processed_data" not in st.session_state or st.session_state.processed_data is None:
-        st.info("Process a PDF to enable semantic search.")
-        return
-
-    data = st.session_state.processed_data
-    chunks = data["chunks"]
-    indexer = data["indexer"]
-    embedder = data["embedder"]
-
-    st.subheader("Semantic Search")
-    if embedder and embedder.model is not None and indexer:
-        query_text = st.text_input("Search for similar content:", key="search_query_input")
-        if query_text:
-            query_embedding = generate_embeddings(embedder, [query_text])
-
-            if query_embedding is not None and query_embedding.shape[0] > 0:
-                distances, indices = indexer.search(query_embedding, k=app_config.faiss_indexer.k_search)
-                st.write(f"Search Results (Top {app_config.faiss_indexer.k_search}):")
-                for i, idx in enumerate(indices[0]):
-                    st.caption(f"Rank {i+1} (Dist: {distances[0][i]:.4f}): Chunk {idx} - {chunks[idx][:150]}...")
-            else:
-                st.warning("Could not generate embedding for the query.")
-    else:
-        st.warning("Search components not ready. Process a PDF.")
-
-
-def main():
-    # Load configurations
-    app_config = load_config()
-
-    # Load environment variables from .env file
-    # The .env file should be at /Users/vi/Documents/work/dashboard_analysis/serious/.env
-    dotenv_path = "/Users/vi/Documents/work/dashboard_analysis/serious/.env"
-    load_dotenv(dotenv_path=dotenv_path)
-
-    st.set_page_config(page_title=app_config.streamlit_ui.title, layout="wide")
-    st.title(app_config.streamlit_ui.title)
-
-    # Initialize session state
-    if "processed_data" not in st.session_state:
-        st.session_state.processed_data = None
-    if "pdf_file_name" not in st.session_state:
-        st.session_state.pdf_file_name = None
-    if "processing_complete_for_current_file" not in st.session_state:
-        st.session_state.processing_complete_for_current_file = False
-
-
-    # Display app sections
-    display_processing_section(app_config) # This is a fragment, will run its content
-
-    if st.session_state.processed_data is not None:
-        display_visualization_section(app_config) # This is a fragment
-        display_search_section(app_config)       # This is a fragment
-
-        # For the question generation, which should be in the sidebar:
-        # Call the content function within st.sidebar context, and that function is decorated with @st.fragment
-        @st.fragment # Decorate the wrapper that calls the content function
-        def display_question_generation_sidebar_wrapper(config): # Wrapper function
-            question_generation_fragment_content(config) # Call the actual content function
-
-        with st.sidebar: # Place the call to the wrapper fragment in the sidebar
-            display_question_generation_sidebar_wrapper(app_config)
-    else:
-        st.info("Upload a PDF to begin analysis.")
-
 
 if __name__ == '__main__':
     main()
